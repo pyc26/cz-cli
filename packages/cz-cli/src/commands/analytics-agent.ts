@@ -1106,6 +1106,41 @@ function extractBusinessError(payload: unknown): { code: string; message: string
   return null
 }
 
+/**
+ * Session polling responses use a second, event-level protocol. The HTTP and
+ * outer business envelopes can both report success while a model invocation
+ * is represented by a `responses[].dataType === "error"` event. Keep this
+ * check separate from extractBusinessError(), which handles the normal API
+ * envelopes shared by the other Analytics Agent commands.
+ */
+function extractResponseEventError(payload: unknown): { code: string; message: string } | null {
+  const data = unwrapResponse(payload)
+  if (!data || typeof data !== "object" || Array.isArray(data)) return null
+  const responses = (data as Record<string, unknown>).responses
+  if (!Array.isArray(responses)) return null
+
+  const errorEntry = responses.find((entry) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return false
+    return (entry as Record<string, unknown>).dataType === "error"
+  })
+  if (!errorEntry || typeof errorEntry !== "object" || Array.isArray(errorEntry)) return null
+
+  const entry = errorEntry as Record<string, unknown>
+  const modelRes = entry.modelRes
+  const modelResRecord = modelRes && typeof modelRes === "object" && !Array.isArray(modelRes)
+    ? modelRes as Record<string, unknown>
+    : undefined
+  const message = extractMessageValue(modelResRecord?.data)
+    ?? extractMessageValue(entry.summaryData)
+    ?? extractMessageValue(modelResRecord?.message)
+    ?? extractMessageValue(entry.message)
+
+  return {
+    code: "ANALYTICS_AGENT_ERROR",
+    message: message ?? "Analytics Agent returned an error event",
+  }
+}
+
 function latestResponseDataType(payload: unknown): string {
   const data = unwrapResponse(payload)
   if (!data || typeof data !== "object" || Array.isArray(data)) return ""
@@ -1118,7 +1153,15 @@ function latestResponseDataType(payload: unknown): string {
 }
 
 function isTerminalResponse(payload: unknown): boolean {
+  if (extractResponseEventError(payload)) return true
   return ["finish", "finish_stop", "error"].includes(latestResponseDataType(payload))
+}
+
+function extractMessageValue(value: unknown): string | undefined {
+  if (typeof value === "string") return value
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined
+  const message = (value as Record<string, unknown>).message
+  return typeof message === "string" ? message : undefined
 }
 
 function extractModelMessage(entry: unknown): string | undefined {
@@ -1128,8 +1171,7 @@ function extractModelMessage(entry: unknown): string | undefined {
   if (!modelRes || typeof modelRes !== "object" || Array.isArray(modelRes)) return undefined
   const data = (modelRes as Record<string, unknown>).data
   if (!data || typeof data !== "object" || Array.isArray(data)) return undefined
-  const message = (data as Record<string, unknown>).message
-  return typeof message === "string" ? message : undefined
+  return extractMessageValue(data)
 }
 
 /**
@@ -1236,7 +1278,7 @@ async function executeSessionRunCommand(
   try {
     const ctx = await resolveAnalyticsContext(argv)
     const runPayload = await requestAnalytics(argv, ROUTES.sessionRun, body, {}, ctx)
-    const bizErr = extractBusinessError(runPayload)
+    const bizErr = extractBusinessError(runPayload) ?? extractResponseEventError(runPayload)
     if (bizErr) {
       logOperation(name, { ok: false, timeMs: Date.now() - t0 })
       error(bizErr.code, bizErr.message, { format })
@@ -1262,7 +1304,7 @@ async function executeSessionRunCommand(
     } finally {
       spinner.stop()
     }
-    const pollErr = extractBusinessError(payload)
+    const pollErr = extractBusinessError(payload) ?? extractResponseEventError(payload)
     if (pollErr) {
       logOperation(name, { ok: false, timeMs: Date.now() - t0 })
       error(pollErr.code, pollErr.message, { format })
@@ -1684,12 +1726,14 @@ async function executeAnalyticsCommand(
   body: Record<string, unknown>,
   query: Record<string, unknown> = {},
   buildAiMessage?: (data: unknown) => string | undefined,
+  inspectResponseEvents = false,
 ): Promise<void> {
   const format = typeof argv.format === "string" ? argv.format : "json"
   const t0 = Date.now()
   try {
     const payload = await requestAnalytics(argv, route, body, query)
     const bizErr = extractBusinessError(payload)
+      ?? (inspectResponseEvents ? extractResponseEventError(payload) : null)
     if (bizErr) {
       logOperation(name, { ok: false, timeMs: Date.now() - t0 })
       error(bizErr.code, bizErr.message, { format })
@@ -2088,6 +2132,12 @@ async function executeAnalyticsPollCommand(
       if (isTerminalResponse(payload) || Date.now() >= deadline) break
       await Bun.sleep(intervalMs)
     } while (true)
+    const pollErr = extractBusinessError(payload) ?? extractResponseEventError(payload)
+    if (pollErr) {
+      logOperation(name, { ok: false, timeMs: Date.now() - t0 })
+      error(pollErr.code, pollErr.message, { format })
+      return
+    }
     logOperation(name, { ok: true, timeMs: Date.now() - t0 })
     const summary = extractSummaryString(payload) ?? extractFinalSummary(payload)
     if (summary) {
@@ -4107,7 +4157,7 @@ export function registerAnalyticsAgentCommand(cli: Argv<GlobalArgs>): void {
                 await executeAnalyticsPollCommand("analytics-agent session result", argv as Record<string, unknown>, ROUTES.sessionResult, body)
                 return
               }
-              await executeAnalyticsCommand("analytics-agent session result", argv as Record<string, unknown>, ROUTES.sessionResult, body)
+              await executeAnalyticsCommand("analytics-agent session result", argv as Record<string, unknown>, ROUTES.sessionResult, body, {}, undefined, true)
             },
           )
           .command(

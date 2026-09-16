@@ -159,6 +159,92 @@ describe("analytics-agent session run", () => {
     expect(result.output).toContain("Another question is currently being processed")
   })
 
+  test("fails when a model error event is followed by finish_stop", async () => {
+    onStudio("/open/text2insight/query", () => ({ data: { questionId: 123 } }))
+    onStudio("/open/safe_question_poll", () => ({
+      success: true,
+      data: {
+        questionId: 123,
+        responses: [
+          {
+            dataType: "error",
+            modelRes: {
+              code: 200,
+              success: true,
+              data: { message: "Analysis failed: OpenAI API call failed with status 401: invalid_api_key" },
+            },
+          },
+          {
+            dataType: "finish_stop",
+            modelRes: { data: { message: "Analysis complete" } },
+          },
+        ],
+      },
+    }))
+
+    const result = await runAnalyticsCli([
+      "analytics-agent",
+      "session",
+      "run",
+      "--session-id",
+      "7",
+      "--msg",
+      "hello",
+    ])
+
+    expect(result.exitCode).not.toBe(0)
+    expect(result.output).toContain("invalid_api_key")
+    expect(result.output).not.toContain('"dataType":"finish_stop"')
+    expect(JSON.parse(result.output.trim()).error.code).toBe("ANALYTICS_AGENT_ERROR")
+  })
+
+  test("fails for nested model errors in session result wait mode", async () => {
+    onStudio("/open/safe_question_poll", () => ({
+      success: true,
+      data: {
+        responses: [{
+          dataType: "error",
+          modelRes: { data: { message: "model does-not-exist not found" } },
+        }],
+      },
+    }))
+
+    const result = await runAnalyticsCli([
+      "analytics-agent",
+      "session",
+      "result",
+      "123",
+      "--wait",
+    ])
+
+    expect(result.exitCode).not.toBe(0)
+    expect(result.output).toContain("model does-not-exist not found")
+    expect(JSON.parse(result.output.trim()).error.code).toBe("ANALYTICS_AGENT_ERROR")
+  })
+
+  test("fails for nested model errors in non-waiting session result mode", async () => {
+    onStudio("/open/safe_question_poll", () => ({
+      success: true,
+      data: {
+        responses: [{
+          dataType: "error",
+          modelRes: { data: { message: "model does-not-exist not found" } },
+        }],
+      },
+    }))
+
+    const result = await runAnalyticsCli([
+      "analytics-agent",
+      "session",
+      "result",
+      "123",
+    ])
+
+    expect(result.exitCode).not.toBe(0)
+    expect(result.output).toContain("model does-not-exist not found")
+    expect(JSON.parse(result.output.trim()).error.code).toBe("ANALYTICS_AGENT_ERROR")
+  })
+
   test("uses the first question as title when auto-creating a session", async () => {
     let createBody: Record<string, unknown> | undefined
 
